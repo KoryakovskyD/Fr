@@ -1,0 +1,809 @@
+#!/bin/bash
+###############################################################################
+# Программа предназначена для обнаружения/замены строк в файлах по шаблону.
+#
+# Разработчики: Коряковский Д.О. НИС-315 тел.1502
+# Дата последней корректировки: 24.08.2018
+###############################################################################
+
+
+
+
+#####################################################################VARS
+
+
+# Версия
+declare -r Ver="2.03"
+
+# Показывать строки, которые есть в файле шаблона,
+# но отсутствуют в соответствующем файле заданного каталога
+declare fShowAbsentStr=0
+
+# Имя каталога с шаблонами
+declare -r templsDirName="templs"
+
+# Имя каталога с каталогами ip-адресов удалённых машин
+declare -r AllIPRemoteMachinesDir="ipaddress"
+
+# Режим работы программы (0 - локальная замена 1 - локальное сканирование 2 - удалённое сканирование)
+declare -i fScanMode=0
+
+# Текстовое описание режима работы программы
+declare ModeDescription=""
+
+# Каталог, в котором будет проводиться поиск/замена строк в файлах по шаблону
+declare work_path=""
+
+# Директория расположения файлов пользователя программы (логфайла,...)
+declare -r usrProgDir=~/FR/
+
+# Логфайл
+declare -r logfile=~/FR/logfile.fr
+
+# Переменная для сохранения строки после выполнения функции
+FindStrInFileRet=""
+
+# Номер строки при поиске совпадения по файлу (первое вхождение)
+declare -i CurrentStrNum=0
+
+# Ассоциативный массив каталогов/IP-адресов удалённых машин
+declare -A ha_remoteMachinesIP
+
+# Счётчик массива каталогов/IP-адресов удалённых машин
+declare -i massIp_Counter=0
+
+# Список общих файлов шаблонов для режима удалённого сканирования
+declare TemplFilesRemCommon=""
+
+# Каталог для монтирования удаленных ЭВМ
+declare -r MountPath="/mnt/$USER/fr"
+
+# Версия ядра ОС
+declare -r kernver=`uname -r | awk -F'-' '{ print $1 }'`
+
+# Формат задания интервала для пинга
+if [ "$kernver" \> "3.9.5" ]; then   #старше FC19
+    declare -r pingIkey="-i0,3"
+else                                 #FC19 и до нее
+    declare -r pingIkey="-i0.3"
+fi
+
+# Ассоциативный массив общих файлов, уже проанализированных для конкретной удалённой машины
+declare -A ha_CommonTFilesProceed
+
+# Счётчик массива проанализированных общих файлов-шаблонов
+declare -i ha_CommonTFilesProceed_Counter=0
+
+# Флаг существование общих файло-шаблонов
+declare -i fTFilesExists=0
+
+# Счётчик файлов (совпадающих именами с файлами-шаблонами) в рабочем каталоге
+declare -i CountAllFiles=0
+
+# Счётчик файлов со строками, отличными от шаблонных
+declare -i ModCountDiffer=0
+
+# Счётчик измененных файлов
+declare -i ModCount=0
+
+# Признак того, что надо выполнить запись в логфайл
+declare -i fNeedWriteToLog=0
+
+
+
+
+
+# Файл библиотечных утилит
+Utils_Lib="/opt/mfp/UTILITIES/utils.lib"
+
+
+#####################################################################FUNCS
+
+
+
+# Функция отмонтирования от точки монтирования $MountPath
+# retcode:
+#   функция возвращает 0 в случае успеха
+#   в случае ошибки программа завершается
+FRumont()
+{
+   sudo umount $MountPath &>/dev/null
+   um_retval=$?
+   if [ "$um_retval" != "0" ]; then
+      SuperEcho -fg 'Red' -add 'Bright' -log "${logfile}" "[ ОШИБКА ]: Отмонирование из каталога \"$MountPath\" не произведено!\n"
+      exit 1
+   fi
+   return $um_retval
+}
+
+
+
+# Функция поиска строки в файле по ключевому полю
+# Строки-комментарии вида  //...  и  /* ... */  пропускаются
+# Параметры:
+#  1 - поле, по которому будет осуществляться поиск строки
+#  2 - файл, в котором будет осуществляться поиск строки
+# Найденная строка заносится в глобальную переменную $FindStrInFileRet
+# Функция возвращает в глобальную переменную $CurrentStrNum номер найденной строки или 0 если строка не найдена
+# retcode:
+#   0 - строка найдена
+#   1 - строка не найдена
+FindStrInFile()
+{
+   # Входные параметры
+   local Field="$1"
+   local File="$2"
+
+   FindStrInFileRet=""
+
+   # Счётчик строк в текущем файле
+   CurrentStrNum=1
+
+   # Делаем разделителем только перевод строки
+   local savIFS=$IFS
+   IFS=$'\n'
+   # Цикл по каждой строке заданного файла
+   for line in `cat "$File" 2>/dev/null`; do
+      # Пропускаем строки с комментариями
+      if [ "`echo $line | grep '^[ \t]*//'`" == "" ] && [ "`echo $line | grep '^[ \t]*/\*'`" == "" ]; then
+         # Если строка содержит заданное поле
+         if [ "`echo $line | awk {'print $2'}`" == "$Field" ]; then
+            FindStrInFileRet="$line"
+
+            IFS=$savIFS
+            # Строка найдена, в $CurrentStrNum её номер
+            return 0
+         fi
+      fi
+      let CurrentStrNum=$CurrentStrNum+1
+   done
+
+   IFS=$savIFS
+   # Если не нашли
+   CurrentStrNum=0
+   return 1
+}
+
+
+
+# Функция анализа списка файлов шаблонов на корректность
+# args:
+#  1  - каталог шаблонов
+#  2  - список файлов шаблонов
+#
+# retcode:
+#  0  - OK
+#  1  - Список файлов шаблонов пуст
+#  2  - В списке файлов шаблонов есть дубли
+PreTemplFilesAnalysis()
+{
+   # Проверка наличия файлов шаблонов
+   if [ "$2" == "" ]; then
+      SuperEcho -fg 'Yellow' -add 'Bright' -log "${logfile}" "[ ПРЕДУПРЕЖДЕНИЕ ]: В каталоге \"$1\" шаблоны не найдены!\n"
+      return 1
+   fi
+
+   # Имя предыдущего файла-шаблона
+   PrevNameTempls=""
+   # Проверка на одинаковые имена файлов-шаблонов
+   for CurNameTempls in "$2"; do
+      if [ "$PrevNameTempls" != "" ]; then
+         if [ "`basename $CurNameTempls`" == "`basename $PrevNameTempls`" ]; then
+            SuperEcho -fg 'Yellow' -add 'Bright' -log "${logfile}" "\n[ ПРЕДУПРЕЖДЕНИЕ ]: В каталоге \"$TemplsDir\" есть шаблоны с одинаковыми именами!\n"
+            SuperEcho -fg 'Red' -add 'Bright' -log "${logfile}" "$CurNameTempls\n"
+            SuperEcho -fg 'Red' -add 'Bright' -log "${logfile}" "$PrevNameTempls\n\n"
+            return 2
+         fi
+      fi
+      PrevNameTempls=$CurNameTempls
+   done
+
+   return 0
+}
+
+
+
+# Функция сканирования/замены строк файлов каталога поиска по данным из файлов шаблонов
+# args:
+#  1  - каталог поиска (локальный или точку монтирования с удалённой машины)
+#  2  - каталог шаблонов
+#  3  - список файлов-шаблонов
+#  4  - список общих файлов-шаблонов (только для режима удалённого сканирования при проходе по
+#       индивидуальной части)
+#
+# retcode:
+#  0  - OK
+#  1  - Список файлов шаблонов некорректен
+#  2  - Список аргументов функции не полон
+FindTemplDataInWorkDir()
+{
+   if [ -z "$1" ]; then    # Не найден 1ый аргумент
+      SuperEcho -fg 'Yellow' -add 'Bright' -log "${logfile}" "[ ПРЕДУПРЕЖДЕНИЕ ]: аргумент <каталог поиска> не найден\n"
+      return 2
+   fi
+
+   if [ -z "$2" ]; then    # Не найден 2ой аргумент
+      SuperEcho -fg 'Yellow' -add 'Bright' -log "${logfile}" "[ ПРЕДУПРЕЖДЕНИЕ ]: аргумент <каталог шаблонов> не найден.\n"
+      return 2
+   fi
+
+   if [ -z "$3" ]; then    # Не найден 3ий аргумент
+      SuperEcho -fg 'Yellow' -add 'Bright' -log "${logfile}" "[ ПРЕДУПРЕЖДЕНИЕ ]: аргумент <список файлов шаблонов> не найден.\n"
+      return 2
+   fi
+
+   # Сохраняем список файлов-шаблонов
+   local listOfTemplFiles="$3"
+
+   # Проверяем валидность списка файлов-шаблонов
+   PreTemplFilesAnalysis "$2" "$listOfTemplFiles"
+   if [ "$?" == "1" ]; then
+      return 1
+   fi
+
+
+   # Цикл по всем файлам шаблонам
+   for CurrentTemplFile in $listOfTemplFiles; do
+
+      # Если файл-шаблон не задан, то пропускаем его
+      if [ "$CurrentTemplFile" == "" ]; then
+         continue
+      fi
+
+      # В указанном каталоге поиска ищем файлы, у которых имя совпадает с именем текущего файла-шаблона
+      FilesNamedCurTF=`find "$1" -type f -name "\`basename $CurrentTemplFile\`" 2>/dev/null`
+
+      # Проверка - нашлись ли файлы...
+      if [ "$FilesNamedCurTF" == "" ]; then      # если нет...
+            SuperEcho -fg 'Yellow' -add 'Bright' -log "${logfile}" "\n[ ПРЕДУПРЕЖДЕНИЕ ]: Файл \"\`basename $CurrentTemplFile\`\" отсутствует в каталоге \"$work_path\"!\n\n"
+            SuperEcho -log "${logfile}" "----------------------------------------------------------------\n"
+      else                                       # если нашли...
+
+         # Список общих файлов-шаблонов (если такие есть для текущего файла-шаблона)
+         # Для режима удалённого сканирования должен быть максимум один, одноимённый с текущим
+         FilesNamedCurTFCommon=""
+
+         # Счётчик одноимённых файлов-шаблонов для текущего файла-шаблона
+         FilesNamedCurTFCommon_Counter=""
+
+         # Есть ли такой же файл среди общих файлов-шаблонов
+         # В случае режима удалённого сканирования и не проход по общим файлам-шаблонам
+         if [ "$fScanMode" == "2" ] && [ "`basename $2`" != "$AllIPRemoteMachinesDir" ] && [ "$4" != "" ]; then
+            # В списке общих файлов-шаблонов ищем файлы, у которых имя совпадает с именем текущего индивидуального файла-шаблона
+            FilesNamedCurTFCommon=`find $4 -type f -name "\`basename $CurrentTemplFile\`" 2>/dev/null`
+            # Количество файлов с таким именем (должен быть один или ноль)
+            FilesNamedCurTFCommon_Counter="`echo "$FilesNamedCurTFCommon" | wc -w`"
+
+            if [ "$FilesNamedCurTFCommon_Counter" -gt 1 ]; then
+               SuperEcho -fg 'Yellow' -add 'Bright' -log "${logfile}" "[ ПРЕДУПРЕЖДЕНИЕ ]: Общих файлов-шаблонов с именем \"\`basename $CurrentTemplFile\`\" больше одного!\n"
+               continue
+            fi
+         fi
+
+
+         # Получаем все поля текущего файла-шаблона
+         AllCurTFFields=`grep -v '^[ \t]*/\*' $CurrentTemplFile | awk '{print $2}'`
+
+         if [ "AllCurTFFields" == "" ]; then
+            SuperEcho -fg 'Yellow' -add 'Bright' -log "${logfile}" "[ ПРЕДУПРЕЖДЕНИЕ ]: Файл-шаблон \"$CurrentTemplFile\" не содержит записей!\n"
+            continue   # Файл шаблона не содержит актуальных полей
+         fi
+
+
+         # Если одноимённый общий файл-шаблон существует
+         if [ "$fScanMode" == "2" ] && [ "$FilesNamedCurTFCommon_Counter" == "1" ]; then
+
+            # Добавляем одноимённый общий файл-шаблон в массив обработанных
+            ha_CommonTFilesProceed["$ha_CommonTFilesProceed_Counter"]="`basename $CurrentTemplFile`"
+            (( ha_CommonTFilesProceed_Counter++ ))
+
+
+            # Получаем все поля общего файла-шаблона
+            AllCurTFFieldsCommon=`grep -v '^[ \t]*/\*' $FilesNamedCurTFCommon | awk '{print $2}'`
+
+            if [ "AllCurTFFieldsCommon" == "" ]; then
+               SuperEcho -fg 'Yellow' -add 'Bright' -log "${logfile}" "[ ПРЕДУПРЕЖДЕНИЕ ]: Общий файл-шаблон \"$FilesNamedCurTFCommon\" не содержит записей!\n"
+               continue   # Файл шаблона не содержит актуальных полей
+            fi
+
+
+            # Сохраняем список полей файла-шаблона для добавления
+            AllCurTFFields_old_tmp=$AllCurTFFields
+
+
+            # Из списка полей одноимённого общего общего файла-шаблона добавляем в список полей шаблона те
+            # поля, которых в этом файле-шаблоне не было
+            for CurFieldComm in $AllCurTFFieldsCommon; do
+               # Флаг наличия поля
+               local CurFiComExists=0
+               # Есть ли в списке такое поле
+               for CurFieldIndiv in $AllCurTFFields_old_tmp; do
+                  if [ "$CurFieldComm" == "$CurFieldIndiv" ]; then
+                     CurFiComExists=1
+                  fi
+               done
+               # Если нет - добавляем
+               if [ "$CurFiComExists" == "0" ]; then
+                  AllCurTFFields=`echo -e "$AllCurTFFields\n$CurFieldComm"`
+               fi
+            done
+
+         fi
+
+
+         # Номер текущей строки в заданном каталоге, в которой должны быть заменены поля
+         CurrentStrNum=0
+
+         # Цикл по каждому файлу (совпадающему именем с текущим файлом-шаблоном) в заданном каталоге
+         for CurrentFile in $FilesNamedCurTF; do
+
+            # Считаем общее количество файлов (совпадающих именами с файлами-шаблонами) в рабочем каталоге
+            let CountAllFiles=$CountAllFiles+1
+
+            SuperEcho -log "${logfile}" "\n----------------------------------------------------------------\n"
+
+            # Отображение корректного с визуальной точки зрения имени файла
+            show_CurrentFile=$CurrentFile
+            # Если режим удалённого сканирования, то заменяем точку монтирования на каталог поиска в псевдоимени файла
+            if [ "$fScanMode" == "2" ]; then
+               show_CurrentFile=${show_CurrentFile/#$MountPath/$work_path}
+            fi
+
+            # Вывод псевдоимени текущего файла из заданного каталога
+            SuperEcho -log "${logfile}" "\nОбработка файла N$CountAllFiles: $show_CurrentFile\n"
+
+            # Расширенная печать либо в лог, либо на экран
+            # Если запись в логфайл не отключена
+            if [ "$OFFLOG" != "1" ]; then
+               # Отключение вывода на экран
+               OFFSCREEN=1
+            fi
+
+
+            # Признак, что строки текущего файла заданного каталога отличаются от строк в файле-шаблоне
+            fCurrentFileDiffer=0
+
+            # Признак, что текущий файл заданного каталога был модифицирован
+            fCurrentFileMod=0
+
+
+            # Цикл по всем полям текущего файла шаблона
+            for CurrentField in $AllCurTFFields; do
+
+               # Номер строки в файле каталога поиска, где будет найдено совпадение по ключевому полю
+               local SearchFileStrNum=0
+
+               # Ищем текущее поле в текущем файле архива (код возврата функции - в $CurrentStrNum)
+               FindStrInFile "$CurrentField" "$CurrentFile"
+               # Если не нашли строку с текущим полем в текущем файле заданного каталога...
+               if [ "$CurrentStrNum" == "0" ]; then
+                  if [ "$fShowAbsentStr" == "1" ]; then
+                     fNeedWriteToLog=1
+                     SuperEcho -log "${logfile}" "[ ИНФО ]: Поле \"$CurrentField\" в файле каталога поиска не найдено!\n"
+                  fi
+                  continue   # Переходим к следующему полю
+               fi
+               # Номер найденной строки
+               SearchFileStrNum="$CurrentStrNum"
+               # Найденая строка в текущем файле заданного каталога
+               StrIn="$FindStrInFileRet"
+
+
+               # Ищем текущее поле в текущем файле-шаблоне
+               FindStrInFile "$CurrentField" "$CurrentTemplFile"
+
+               # Если в текущем файле-шаблоне такого поля нет, ищем в общем файле-шаблоне
+               if [ "$CurrentStrNum" == "0" ] && [ "$fScanMode" == "2" ] && [ "$FilesNamedCurTFCommon_Counter" == "1" ]; then
+
+                  FindStrInFile "$CurrentField" "$FilesNamedCurTFCommon"
+
+                  # Если не нашли строку с текущим полем в общем файле-шаблоне...
+                  if [ "$CurrentStrNum" == "0" ]; then
+                     if [ "$fShowAbsentStr" == "1" ]; then
+                        fNeedWriteToLog=1
+                        SuperEcho -fg 'Yellow' -add 'Bright' -log "${logfile}" "[ ПРЕДУПРЕЖДЕНИЕ ]: Поле \"$CurrentField\" в общем файле-шаблоне не найдено!\n"
+                     fi
+                     continue   # Переходим к следующему полю
+                  fi
+               elif [ "$CurrentStrNum" == "0" ]; then
+                  SuperEcho -fg 'Yellow' -add 'Bright' -log "${logfile}" "[ ПРЕДУПРЕЖДЕНИЕ ]: Поле \"$CurrentField\" в файле-шаблоне не найдено!\n"
+               fi
+
+               # Строка текущего файла шаблона
+               StrOut="$FindStrInFileRet"
+
+
+               # Если строки в файле заданного каталога и файле шаблона не равны...
+               if [ "$StrIn" != "$StrOut" ]; then
+
+                  # В анализируемом файле и в файле-шаблоне есть несовпадения
+                  fCurrentFileDiffer=1
+
+                  # Экранируем спецсимволы
+                  StrIn1=`echo "$StrIn" | sed -e 's/\//\\\\\//g' -e 's/\*/\\\\\*/g'`
+                  StrOut1=`echo "$StrOut" | sed -e 's/\//\\\\\//g' -e 's/*/\\\\\*/g'`
+
+                  # Если нужно модифицировать строки в файлах
+                  if [ "$fScanMode" == "0" ]; then      # Режим локальной замены
+                     # Заменяем строку в файле заданного каталога на соответствующую строку из файла шаблона
+                     sed -i -e "s/$StrIn1/$StrOut1/" $CurrentFile 2> /dev/null
+
+                     if [ "$?" != "0" ]; then
+                        SuperEcho -log "${logfile}" "  Строка №: $SearchFileStrNum\n"
+                        SuperEcho -fg 'Yellow' -add 'Bright' -log "${logfile}" "    [ ПРЕДУПРЕЖДЕНИЕ ]: строка не заменена!\n"
+                        fNeedWriteToLog=1
+                        continue  # Переходим к следующему полю
+                     fi
+
+                     fCurrentFileMod=1
+                  fi
+
+                  SuperEcho -log "${logfile}" "  Строка №: $SearchFileStrNum\n"
+                  SuperEcho -log "${logfile}" "    Старое значение: $StrIn\n"
+                  SuperEcho -log "${logfile}" "    Новое значение:  $StrOut\n"
+                  fNeedWriteToLog=1
+               fi
+            done  # Цикл по всем полям текущего файла шаблона
+
+            # Подсчитываем количество файлов с отличиями от шаблонов
+            if [ "$fCurrentFileDiffer" != "0" ]; then
+               let ModCountDiffer=$ModCountDiffer+1
+            fi
+
+            # Подсчитываем количество модифицированных файлов
+            if [ "$fCurrentFileMod" != "0" ]; then
+               let ModCount=$ModCount+1
+            fi
+
+
+            # Восстанавливаем методику вывода
+            # Включаем вывод на экран
+            OFFSCREEN=0
+
+
+            SuperEcho "\n"
+
+         done  # Цикл по каждому файлу(совпадающему именем с текущим файлом-шаблоном) в заданном каталоге
+      fi  # Проверка - нашлись ли файлы, у которых имя совпадает с именем текущего файла-шаблона
+   done  # Цикл по всем файлам шаблонам
+
+   return 0
+}
+
+
+
+# Функция вывода статистики (на экран или в файл)
+# args:
+#  1  - каталог поиска (локальный или точку монтирования с удалённой машины)
+#
+# retcode:
+#  0  - OK
+GetStat()
+{
+   # Если было хоть одно совпадение с полями из шаблона, то выводим общую статистику
+   if [ "$fNeedWriteToLog" == "1" ]; then
+
+      # Ессли файлы были модифицированы
+      if [ "$ModCount" -gt "0" ]; then
+         SuperEcho -fg 'Yellow' -add 'Bright' "Файлы в \"$1\" были изменены!!!\n"
+      fi
+
+      # Если режим замены
+      if [ "$fScanMode" == "0" ]; then
+         # Выводим количество модифицированных файлов заданного каталога
+         SuperEcho -fg 'Blue' -add 'Bright' -log "${logfile}" "\nКоличество изменённых файлов: $ModCount\n"
+      fi
+
+      # Выводим количество файлов заданного каталога, отличающихся от шаблона
+      SuperEcho -fg 'Blue' -add 'Bright' -log "${logfile}" "\nКоличество файлов с расхождениями: $ModCountDiffer\n"
+
+   fi
+
+   # Отключение вывода на экран
+   OFFSCREEN=1
+   SuperEcho -log "${logfile}" "\n##########################################################################\n"
+   # Включение вывода на экран
+   OFFSCREEN=0
+
+   SuperEcho "\n"
+
+   # Обнуление глобальных статистических переменных
+   CountAllFiles=0
+   ModCountDiffer=0
+   ModCount=0
+   fNeedWriteToLog=0
+
+   return 0
+}
+
+
+
+#####################################################################MAIN
+
+
+
+# Указание взять файл библиотечных утилит из текущего каталога в случае, если в указанном ранее имени файла отсутствует путь к ней
+if [ -f "./$Utils_Lib" ]; then
+    Utils_Lib="./$Utils_Lib"
+fi
+
+# Проверяем, существует ли файл библитечных утилит
+if [ ! -f "$Utils_Lib" ]; then
+    if [ -f "`dirname $0`/`basename $Utils_Lib`" ]; then
+        Utils_Lib="`dirname $0`/`basename $Utils_Lib`"
+    else
+        echo "ОШИБКА: Нет файла \"$Utils_Lib\"!"
+        exit 1
+    fi
+fi
+
+
+# Файл библиотечных утилит
+. $Utils_Lib
+
+
+
+
+
+SuperEcho -fg 'Blue' -add 'Bright' "\nfr v$Ver | Программа для обнаружения/замены строк в файлах по шаблону\n\n"
+
+###################
+# АНАЛИЗ ПАРАМЕТРОВ
+###################
+
+# Проверка наличия аргумента у команды
+if [ "$#" -lt "1" ]; then
+    SuperEcho "USAGE: `basename $0` [--lsm|--rsm] work_path [templates_path] [--showabs] [--screen]
+      --lsm          - local scan mode (without changing files on local machine)
+      --rsm          - remote scan mode (without changing files on remote machines)
+      work_path      - directory where program will search files for scan/replace strings
+      templates_path - directory with template files (~/FR/templs by default)
+      --showabs      - show absent strings, which template files has but work files hasn't
+      --screen       - verbose output to screen, otherwise to logfile (~/FR/logfile.fr)
+         EX1: `basename $0` /home/PROJECTS/FRTEST
+         EX2: `basename $0` --rsm /home/PROJECTS/FRTEST /home/PROJECTS/TEST/templs --screen\n"
+    exit 0
+fi
+
+
+# Создаём директорию файлов пользователя программы
+mkdir -p $usrProgDir &>/dev/null
+if [ "$?" != "0" ]; then
+   SuperEcho -fg 'Yellow' -add 'Bright' "[ ПРЕДУПРЕЖДЕНИЕ ]: Невозможно создать директорию пользовательских файлов \"$usrProgDir\"!\n"
+fi
+
+
+# Установка режима работы программы
+# Режим локального сканирования (то есть без замены содержимого заданного каталога на машине)
+if [ "$1" == "--lsm" ] || [ "$1" == "--LSM" ]; then
+   fScanMode=1
+   ModeDescription="Режим: локального сканирования"
+   shift
+# Режим удалённого сканирования (то есть без замены содержимого заданного каталога на удалённой(ых) машине(ах))
+elif [ "$1" == "--rsm" ] || [ "$1" == "--RSM" ]; then
+   fScanMode=2
+   ModeDescription="Режим: удалённого сканирования"
+   shift
+else
+   # Режим замены строк в файлах локального каталога work_path по шаблонам
+   fScanMode=0
+   ModeDescription="Режим: локальной замены"
+fi
+
+if [ -z "$1" ]; then    # Не найден аргумент с каталогом для сканирования/модификации файлов
+    SuperEcho -fg 'Red' -add 'Bright' "[ ОШИБКА ]: не задан work_path!\n"
+    exit 1
+fi
+
+# Установка каталога, в котором будет проводиться поиск/замена строк в файлах по шаблону
+work_path="$1"
+
+# Проверка существования локального каталога для сканирования/модификации файлов
+if ! [ -d "$work_path" ]; then
+    SuperEcho -fg 'Red' -add 'Bright' "[ ОШИБКА ]: каталог поиска $work_path не найден!\n"
+    exit 1
+fi
+
+
+# Проверка: задана ли директория с файлами шаблонами...
+if [ "$2" != "" ] && [ "$2" != "--SHOWABS" ] && [ "$2" != "--showabs" ] && [ "$2" != "--screen" ] && [ "$2" != "--screen" ]; then
+   # Шаблоны будут взяты из переданного параметра templates_path
+   TemplsDir=$2
+fi
+
+# Если каталог шаблонов не указан вторым параметром...
+if [ "$2" == "" ] || [ "$2" == "--SHOWABS" ] || [ "$2" == "--showabs" ] || [ "$2" == "--screen" ] || [ "$2" == "--screen" ]; then
+
+   # Шаблоны будут взяты из templs - директории по умолчанию каталога пользователя
+   TemplsDir=~/FR/"$templsDirName"
+fi
+
+# Если программа запущена в одном из локальных режимов
+if [ "$fScanMode" != "2" ]; then
+   # Проверка существования локального каталога шаблонов
+   if ! [ -d "$TemplsDir" ]; then
+      SuperEcho -fg 'Red' -add 'Bright' "[ ОШИБКА ]: каталог шаблонов $TemplsDir не найден!\n"
+      exit 1
+   fi
+fi
+
+# Указан ли параметр выдачи строк, имеющихся в файле шаблона, но отсутствующих в
+# соответствующем файле заданного каталога
+if [ "`echo $@ | grep -i ' --showabs'`" != "" ]; then
+   fShowAbsentStr=1
+fi
+
+###################
+# ВЫВОД СТАРТОВОЙ ИНФОРМАЦИИ
+###################
+
+# Если результат выводим на экран, то логфайл пустой, иначе записываем в него "шапку" программы
+if [ "`echo $@ | grep -i ' --screen'`" != "" ]; then
+   # Отключение записи в логфайл на всём протяжении работы программы
+   declare -r OFFLOG=1
+else
+   # Если логфайл в данном каталоге несоздаваем, то предупреждаем пользователя
+   if ! [ -w $usrProgDir ]; then
+      declare -r OFFLOG=1
+      SuperEcho "[ ПРЕДУПРЕЖДЕНИЕ ]: Каталог \"$usrProgDir\" не доступен для записи, создать логфайл невозможно!\n"
+   else
+      SuperEcho "Логфайл: $logfile\n"
+   fi
+   # Отключение вывода на экран
+   OFFSCREEN=1
+   SuperEcho -log "${logfile}" "File Ruler (fr) v$Ver, Дата={`date`}\n\n"
+   SuperEcho -log "${logfile}" "Директория запуска: $PWD\n"
+   # Включение вывода на экран
+   OFFSCREEN=0
+fi
+
+SuperEcho -log "${logfile}" "Каталог шаблонов: $TemplsDir\n"
+SuperEcho -log "${logfile}" "Каталог поиска: $work_path\n"
+SuperEcho -log "${logfile}" "$ModeDescription\n\n"
+
+
+###################
+# СКАНИРОВАНИЕ / ЗАМЕНА
+###################
+
+# Если задан режим удалённого сканирования
+if [ "$fScanMode" == "2" ]; then
+
+   TemplsDirRemote="$TemplsDir"/"$AllIPRemoteMachinesDir"
+
+   # Проверка наличия каталога шаблонов для удалённого сканирования
+   if ! [ -d "$TemplsDirRemote" ]; then
+      SuperEcho -fg 'Red' -add 'Bright' -log "${logfile}" "[ ОШИБКА ]: каталог \"$TemplsDirRemote\" не найден!\n"
+      exit 1
+   fi
+
+
+   # Получаем список общих файлов шаблонов для удалённого сканирования
+   TemplFilesRemCommon=`find "$TemplsDirRemote" -mindepth 1 -maxdepth 1 -type f | sort`
+
+   if [ "$TemplFilesRemCommon" != "" ]; then
+      fTFilesExists=1
+   fi
+
+   # Получаем из каталога шаблонов для удалённого сканирования подкаталоги конкретных машин,
+   # названных по их IP (т.е. ЧИСЛО1.ЧИСЛО2.ЧИСЛО3.ЧИСЛО4)
+   for remMachFldrName in `find "$TemplsDirRemote" -mindepth 1 -maxdepth 1 -type d -name "[0-9]*" | sort`
+   do
+      if [[ "`basename $remMachFldrName`" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+         ha_remoteMachinesIP["$massIp_Counter"]="`basename $remMachFldrName`"
+         (( massIp_Counter++ ))
+      fi
+   done
+
+
+   # Если каталога для монтирования нет - создаём
+   if ! [ -d "$MountPath" ]; then
+      mkdir -p ${MountPath} &>/dev/null
+      runcmd_retval=$?
+
+      if [ "$runcmd_retval" != "0" ]; then
+         SuperEcho -fg 'Red' -add 'Bright' -log "${logfile}" "[ ОШИБКА ]: Создание точки монтирования \"$MounthPath\" не произведено!\n"
+         exit 1
+      fi
+   fi
+
+
+   # Для каждой удалённой машины
+   for key in ${!ha_remoteMachinesIP[@]}
+   do
+      SuperEcho -log "${logfile}" "\n\n"
+      SuperEcho -log "${logfile}" "####################\n"
+      SuperEcho -log "${logfile}" "ЭВМ: ${ha_remoteMachinesIP[$key]}\n"
+      SuperEcho -log "${logfile}" "####################\n"
+
+      # Проверяем доступность удалённой машины по сети (пингуем)
+      if ! ping ${ha_remoteMachinesIP[$key]} -c5 -w5 $pingIkey &>/dev/null; then
+         SuperEcho -fg 'Yellow' -add 'Bright' -log "${logfile}" "[ ПРЕДУПРЕЖДЕНИЕ ]: ЭВМ \"${ha_remoteMachinesIP[$key]}\" не в сети!\n"
+         continue
+      else
+         SuperEcho -fg 'Green' -add 'Bright' -log "${logfile}" "[ OK ]: Машина в сети\n"
+      fi
+
+
+      # Монтируем с удалённой машины каталог поиска
+      sudo mount ${ha_remoteMachinesIP[$key]}:$work_path $MountPath &>/dev/null
+      if [ "$?" != "0" ]; then
+         SuperEcho -fg 'Yellow' -add 'Bright' -log "${logfile}" "[ ПРЕДУПРЕЖДЕНИЕ ]: Каталог \"$work_path\" с ЭВМ \"${ha_remoteMachinesIP[$key]}\" не доступен по сети!\n"
+         continue
+      else
+         SuperEcho -fg 'Green' -add 'Bright' -log "${logfile}" "[ OK ]: Каталог \"$work_path\" доступен по сети\n"
+      fi
+
+
+      # Обнуляем ассоциативный массив общих файлов, уже проанализированных для данной удалённой машины
+      unset -v 'ha_CommonTFilesProceed'
+      declare -A ha_CommonTFilesProceed
+
+      # Обнуляем счётчик массива проанализированных общих файлов-шаблонов
+      ha_CommonTFilesProceed_Counter=0
+
+
+      # Получаем список файлов-шаблонов для конкретной машины
+      TemplFilesRemMach=`find "$TemplsDirRemote"/"${ha_remoteMachinesIP[$key]}" -type f | sort`
+      if [ "$TemplFilesRemMach" != "" ]; then
+
+         # Сканируем каталог поиска удалённой машины по индивидуальной части, заполняем
+         # ассоциативный массив проанализированных общих файлов-шаблонов
+         FindTemplDataInWorkDir "$MountPath" "$TemplsDirRemote"/"${ha_remoteMachinesIP[$key]}" "$TemplFilesRemMach" "$TemplFilesRemCommon"
+         if [ "$?" != "0" ]; then
+            # Отмонтируем точку монтирования
+            FRumont
+            continue
+         fi
+
+      else
+         SuperEcho -fg 'Yellow' -add 'Bright' -log "${logfile}" "[ ПРЕДУПРЕЖДЕНИЕ ]: В каталоге \"$TemplsDirRemote"/"${ha_remoteMachinesIP[$key]}\" нет файлов-шаблонов!\n"
+      fi
+
+
+      # Если есть общие файлы-шаблоны, то пробегаем по тем из них, которые не были просмотрены в ходе индивидуального прохода
+      if [ "$fTFilesExists" == "1" ]; then
+
+         # Вычитаем из списка общих файлов-шаблонов те, которые уже проанализировали
+         # Для каждого уже обработанного общего файла-шаблона
+         for keyCTF in ${!ha_CommonTFilesProceed[@]}
+         do
+            # Удаляем обработанный общий файл-шаблон из списка общих файлов-шаблонов
+            ProcCTF_tmp="$TemplsDirRemote/${ha_CommonTFilesProceed[$keyCTF]}"
+            TemplFilesRemCommon=("${TemplFilesRemCommon[@]/$ProcCTF_tmp}")
+         done
+
+
+         # Сканируем каталог поиска удалённой машины по общей части,
+         # за исключением уже обработанных общих файлов-шаблонов
+         FindTemplDataInWorkDir "$MountPath" "$TemplsDirRemote" "$TemplFilesRemCommon"
+         if [ "$?" != "0" ]; then
+            # Отмонтируем точку монтирования
+            FRumont
+            continue
+         fi
+
+      fi
+
+      # Отмонтируем точку монтирования
+      FRumont
+
+      # Вывод статистики
+      GetStat "$work_path"
+
+   done # Для каждой удалённой машины
+
+else  # Если задан один из режимов локальной работы (сканирование/замена)
+
+   # Файлы-шаблоны из каталога локальных шаблонов (за исключением удалённых машин)
+   TemplFiles=`find "$TemplsDir" -type f -not -path "*/"$AllIPRemoteMachinesDir"/*" | sort`
+
+   # Сканируем/заменяем в каталоге поиска по данным из файлов шаблонов
+   FindTemplDataInWorkDir "$work_path" "$TemplsDir" "$TemplFiles"
+
+   # Вывод статистики
+   GetStat "$work_path"
+fi
+
+
+SuperEcho -fg 'Green' -add 'Bright' "\nDone\n"
